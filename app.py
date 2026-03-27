@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import io
+import os
 import random
 import re
 import string
@@ -231,6 +232,29 @@ def user_facing_db_error(exc):
     if ":" in msg:
         return msg.split(":")[-1].strip()
     return msg
+
+
+def get_db_connection():
+    # Streamlit Cloud: set [mysql] in app secrets, or use MYSQL_* env vars.
+    try:
+        if hasattr(st, "secrets") and st.secrets and "mysql" in st.secrets:
+            m = st.secrets["mysql"]
+            return mysql.connector.connect(
+                host=m["host"],
+                port=int(m.get("port", 3306)),
+                user=m["user"],
+                password=m["password"],
+                database=m["database"],
+            )
+    except (KeyError, TypeError, FileNotFoundError):
+        pass
+    return mysql.connector.connect(
+        host=os.environ.get("MYSQL_HOST", "localhost"),
+        port=int(os.environ.get("MYSQL_PORT", "3306")),
+        user=os.environ.get("MYSQL_USER", "root"),
+        password=os.environ.get("MYSQL_PASSWORD", "12345678"),
+        database=os.environ.get("MYSQL_DATABASE", "BANKIN"),
+    )
 
 
 def ensure_support_objects():
