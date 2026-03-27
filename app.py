@@ -234,8 +234,24 @@ def user_facing_db_error(exc):
     return msg
 
 
+def _secret_get(mapping, *keys, default=None):
+    # Streamlit secret sections behave like dicts but are not always isinstance(..., dict).
+    for k in keys:
+        try:
+            if mapping is None:
+                break
+            if isinstance(mapping, dict):
+                if k in mapping:
+                    return mapping[k]
+            elif hasattr(mapping, "__getitem__"):
+                return mapping[k]
+        except (KeyError, TypeError):
+            continue
+    return default
+
+
 def _db_params_from_streamlit_secrets():
-    # Accept [mysql], [db], [database], or flat MYSQL_* / mysql_* keys in Secrets.
+    # [mysql] / [db] / [database] — Streamlit secrets sections are not always plain dicts.
     if not hasattr(st, "secrets"):
         return None
     try:
@@ -246,33 +262,68 @@ def _db_params_from_streamlit_secrets():
             if section not in s:
                 continue
             block = s[section]
-            if not isinstance(block, dict):
-                continue
-            return {
-                "host": block["host"],
-                "port": int(block.get("port", 3306)),
-                "user": block["user"],
-                "password": block["password"],
-                "database": block["database"],
-            }
-        host = s.get("MYSQL_HOST") or s.get("mysql_host")
+            host = _secret_get(block, "host", "hostname", "HOST")
+            user = _secret_get(block, "user", "username", "USER")
+            password = _secret_get(block, "password", "passwd", "PASSWORD")
+            database = _secret_get(block, "database", "db", "schema", "DATABASE")
+            port = _secret_get(block, "port", "PORT", default=3306)
+            if host and user and database:
+                ssl_ca = _secret_get(block, "ssl_ca", "ssl_ca_path")
+                params = {
+                    "host": host,
+                    "port": int(port),
+                    "user": user,
+                    "password": password if password is not None else "",
+                    "database": database,
+                }
+                if ssl_ca:
+                    params["ssl_ca"] = ssl_ca
+                return params
+        host = _secret_get(s, "MYSQL_HOST", "mysql_host")
         if host:
-            return {
-                "host": host,
-                "port": int(s.get("MYSQL_PORT") or s.get("mysql_port") or 3306),
-                "user": s.get("MYSQL_USER") or s.get("mysql_user"),
-                "password": s.get("MYSQL_PASSWORD") or s.get("mysql_password"),
-                "database": s.get("MYSQL_DATABASE") or s.get("mysql_database") or "BANKIN",
-            }
+            user = _secret_get(s, "MYSQL_USER", "mysql_user")
+            pwd = _secret_get(s, "MYSQL_PASSWORD", "mysql_password")
+            dbn = _secret_get(s, "MYSQL_DATABASE", "mysql_database", default="BANKIN")
+            port = _secret_get(s, "MYSQL_PORT", "mysql_port", default=3306)
+            if user and dbn:
+                return {
+                    "host": host,
+                    "port": int(port or 3306),
+                    "user": user,
+                    "password": pwd if pwd is not None else "",
+                    "database": dbn,
+                }
     except (KeyError, TypeError, AttributeError):
         pass
     return None
 
 
+def _looks_like_streamlit_cloud():
+    return os.path.isdir("/mount/src") or bool(os.environ.get("STREAMLIT_SERVER_PORT"))
+
+
 def get_db_connection():
     params = _db_params_from_streamlit_secrets()
-    if params and all(params.get(k) for k in ("host", "user", "password", "database")):
+    if params and params.get("host") and params.get("user") and params.get("database"):
         return mysql.connector.connect(**params)
+
+    env_host = os.environ.get("MYSQL_HOST")
+    if env_host:
+        return mysql.connector.connect(
+            host=env_host,
+            port=int(os.environ.get("MYSQL_PORT", "3306")),
+            user=os.environ.get("MYSQL_USER", "root"),
+            password=os.environ.get("MYSQL_PASSWORD", ""),
+            database=os.environ.get("MYSQL_DATABASE", "BANKIN"),
+        )
+
+    if _looks_like_streamlit_cloud():
+        raise RuntimeError(
+            "Database not configured for Streamlit Cloud. In App settings → Secrets, "
+            "add a [mysql] section with host, user, password, database (and optional port). "
+            "You can also use host / hostname and database / db as key names."
+        )
+
     return mysql.connector.connect(
         host=os.environ.get("MYSQL_HOST", "localhost"),
         port=int(os.environ.get("MYSQL_PORT", "3306")),
@@ -1645,8 +1696,15 @@ def inject_light_ui_style():
     )
 
 
-ensure_support_objects()
 st.set_page_config(page_title="BANKIN", layout="wide")
+try:
+    ensure_support_objects()
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
+except mysql.connector.Error as exc:
+    st.error(f"Database connection failed: {user_facing_db_error(exc)}")
+    st.stop()
 inject_light_ui_style()
 st.title("BANKIN")
 
