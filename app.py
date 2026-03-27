@@ -234,20 +234,45 @@ def user_facing_db_error(exc):
     return msg
 
 
-def get_db_connection():
-    # Streamlit Cloud: set [mysql] in app secrets, or use MYSQL_* env vars.
+def _db_params_from_streamlit_secrets():
+    # Accept [mysql], [db], [database], or flat MYSQL_* / mysql_* keys in Secrets.
+    if not hasattr(st, "secrets"):
+        return None
     try:
-        if hasattr(st, "secrets") and st.secrets and "mysql" in st.secrets:
-            m = st.secrets["mysql"]
-            return mysql.connector.connect(
-                host=m["host"],
-                port=int(m.get("port", 3306)),
-                user=m["user"],
-                password=m["password"],
-                database=m["database"],
-            )
-    except (KeyError, TypeError, FileNotFoundError):
+        s = st.secrets
+        if not s:
+            return None
+        for section in ("mysql", "db", "database"):
+            if section not in s:
+                continue
+            block = s[section]
+            if not isinstance(block, dict):
+                continue
+            return {
+                "host": block["host"],
+                "port": int(block.get("port", 3306)),
+                "user": block["user"],
+                "password": block["password"],
+                "database": block["database"],
+            }
+        host = s.get("MYSQL_HOST") or s.get("mysql_host")
+        if host:
+            return {
+                "host": host,
+                "port": int(s.get("MYSQL_PORT") or s.get("mysql_port") or 3306),
+                "user": s.get("MYSQL_USER") or s.get("mysql_user"),
+                "password": s.get("MYSQL_PASSWORD") or s.get("mysql_password"),
+                "database": s.get("MYSQL_DATABASE") or s.get("mysql_database") or "BANKIN",
+            }
+    except (KeyError, TypeError, AttributeError):
         pass
+    return None
+
+
+def get_db_connection():
+    params = _db_params_from_streamlit_secrets()
+    if params and all(params.get(k) for k in ("host", "user", "password", "database")):
+        return mysql.connector.connect(**params)
     return mysql.connector.connect(
         host=os.environ.get("MYSQL_HOST", "localhost"),
         port=int(os.environ.get("MYSQL_PORT", "3306")),
