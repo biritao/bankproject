@@ -8,6 +8,7 @@ import string
 from datetime import date, timedelta
 
 import mysql.connector
+from mysql.connector import pooling
 import streamlit as st
 
 ACCOUNT_TYPES = ["Savings", "Checking", "Business"]
@@ -302,35 +303,64 @@ def _looks_like_streamlit_cloud():
     return os.path.isdir("/mount/src") or bool(os.environ.get("STREAMLIT_SERVER_PORT"))
 
 
-def get_db_connection():
+_CLOUD_DB_MSG = (
+    "Database not configured for Streamlit Cloud. In App settings → Secrets, "
+    "add a [mysql] section with host, user, password, database (and optional port). "
+    "You can also use host / hostname and database / db as key names."
+)
+
+
+def _mysql_connect_kwargs():
+    """Kwargs for mysql.connector / pooling, or None when Cloud has no DB config."""
     params = _db_params_from_streamlit_secrets()
     if params and params.get("host") and params.get("user") and params.get("database"):
-        return mysql.connector.connect(**params)
+        kw = dict(params)
+        kw.setdefault("connection_timeout", 10)
+        return kw
 
     env_host = os.environ.get("MYSQL_HOST")
     if env_host:
-        return mysql.connector.connect(
-            host=env_host,
-            port=int(os.environ.get("MYSQL_PORT", "3306")),
-            user=os.environ.get("MYSQL_USER", "root"),
-            password=os.environ.get("MYSQL_PASSWORD", ""),
-            database=os.environ.get("MYSQL_DATABASE", "BANKIN"),
-        )
+        return {
+            "host": env_host,
+            "port": int(os.environ.get("MYSQL_PORT", "3306")),
+            "user": os.environ.get("MYSQL_USER", "root"),
+            "password": os.environ.get("MYSQL_PASSWORD", ""),
+            "database": os.environ.get("MYSQL_DATABASE", "BANKIN"),
+            "connection_timeout": 10,
+        }
 
     if _looks_like_streamlit_cloud():
-        raise RuntimeError(
-            "Database not configured for Streamlit Cloud. In App settings → Secrets, "
-            "add a [mysql] section with host, user, password, database (and optional port). "
-            "You can also use host / hostname and database / db as key names."
-        )
+        return None
 
-    return mysql.connector.connect(
-        host=os.environ.get("MYSQL_HOST", "localhost"),
-        port=int(os.environ.get("MYSQL_PORT", "3306")),
-        user=os.environ.get("MYSQL_USER", "root"),
-        password=os.environ.get("MYSQL_PASSWORD", "12345678"),
-        database=os.environ.get("MYSQL_DATABASE", "BANKIN"),
+    return {
+        "host": os.environ.get("MYSQL_HOST", "localhost"),
+        "port": int(os.environ.get("MYSQL_PORT", "3306")),
+        "user": os.environ.get("MYSQL_USER", "root"),
+        "password": os.environ.get("MYSQL_PASSWORD", "12345678"),
+        "database": os.environ.get("MYSQL_DATABASE", "BANKIN"),
+        "connection_timeout": 10,
+    }
+
+
+@st.cache_resource
+def _mysql_connection_pool():
+    """Reuse TCP connections to the DB (large win for remote hosts e.g. Aiven)."""
+    kwargs = _mysql_connect_kwargs()
+    if kwargs is None:
+        raise RuntimeError(_CLOUD_DB_MSG)
+    return pooling.MySQLConnectionPool(
+        pool_name="bankin_pool",
+        pool_size=8,
+        pool_reset_session=True,
+        **kwargs,
     )
+
+
+def get_db_connection():
+    kwargs = _mysql_connect_kwargs()
+    if kwargs is None:
+        raise RuntimeError(_CLOUD_DB_MSG)
+    return _mysql_connection_pool().get_connection()
 
 
 def ensure_support_objects():
@@ -991,6 +1021,43 @@ def ensure_support_objects():
         """
     )
 
+    cursor.execute("DROP PROCEDURE IF EXISTS undo_last_renturokning_run")
+    cursor.execute(
+        """
+        CREATE PROCEDURE undo_last_renturokning_run()
+        BEGIN
+            DECLARE v_til DATE;
+
+            SELECT MAX(til_dato) INTO v_til FROM renturokning;
+
+            IF v_til IS NULL THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'No interest run to undo (renturokning is empty)';
+            END IF;
+
+            START TRANSACTION;
+
+            UPDATE account a
+            INNER JOIN (
+                SELECT account_id, SUM(amount) AS renta_sum
+                FROM `transaction`
+                WHERE DATE(transaction_date) = v_til
+                  AND LOWER(TRIM(IFNULL(description, ''))) = 'renta'
+                GROUP BY account_id
+            ) r ON r.account_id = a.account_id
+            SET a.balance = a.balance - r.renta_sum;
+
+            DELETE FROM `transaction`
+            WHERE DATE(transaction_date) = v_til
+              AND LOWER(TRIM(IFNULL(description, ''))) = 'renta';
+
+            DELETE FROM renturokning WHERE til_dato = v_til;
+
+            COMMIT;
+        END
+        """
+    )
+
     cursor.execute("DROP PROCEDURE IF EXISTS register_client_account")
     cursor.execute(
         """
@@ -1127,6 +1194,12 @@ def ensure_support_objects():
     conn.close()
 
 
+@st.cache_resource
+def ensure_support_objects_once_per_worker():
+    """Migrations and procedures are expensive; run once per Streamlit worker, not every rerun."""
+    ensure_support_objects()
+
+
 def fetchall_dict(query, params=None):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
@@ -1137,6 +1210,7 @@ def fetchall_dict(query, params=None):
     return rows
 
 
+@st.cache_data(ttl=60)
 def fetch_account_type_config():
     """Annual rates and labels from account_type_config (source of truth for interest)."""
     return fetchall_dict(
@@ -1698,7 +1772,7 @@ def inject_light_ui_style():
 
 st.set_page_config(page_title="BANKIN", layout="wide")
 try:
-    ensure_support_objects()
+    ensure_support_objects_once_per_worker()
 except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
@@ -1732,6 +1806,10 @@ else:
 
 
 if _portal == "Bank staff (operations)" and not st.session_state.logged_in_client_id:
+    st.caption(
+        "Staff console: open **Interest processing** for interest rates, running interest, and "
+        "**Reset last interest run** (demo / grading)."
+    )
     tab_auth, tab_interest = st.tabs(["Transaction authorizations", "Interest processing"])
 
     with tab_auth:
@@ -1747,14 +1825,54 @@ if _portal == "Bank staff (operations)" and not st.session_state.logged_in_clien
 
         if to_approve:
             st.warning(f"Attention: {len(to_approve)} transactions require manual authorization.")
-            st.caption("Tick one or more drafts, then use bulk authorize below.")
+            st.caption(
+                "Pick drafts in the multiselect, then **Authorize selected**. "
+                "Expand a row below for single authorize or reject."
+            )
+
+            _labels = [
+                f"#{tx['entry_id']} — {format_dkk(tx['amount'])} — {format_dk_account(tx['from_account_id']) or '—'} → {format_dk_account(tx['to_account_id']) or '—'}"
+                for tx in to_approve
+            ]
+            _label_to_entry = dict(zip(_labels, [tx["entry_id"] for tx in to_approve]))
+            _picked = st.multiselect(
+                "Drafts for bulk authorize",
+                options=_labels,
+                key="auth_bulk_multiselect",
+            )
+            selected_ids = [_label_to_entry[k] for k in _picked]
+
+            c_bulk1, c_bulk2 = st.columns([2, 3])
+            with c_bulk1:
+                bulk_btn = st.button(
+                    f"Authorize selected ({len(selected_ids)})",
+                    key="auth_bulk_btn",
+                    disabled=len(selected_ids) == 0,
+                )
+            with c_bulk2:
+                st.caption("Bulk action posts each selected draft via authorize_transaction.")
+
+            if bulk_btn:
+                ok_count = 0
+                failed = []
+                for entry_id in selected_ids:
+                    try:
+                        execute_sql("", callproc=("authorize_transaction", [entry_id]))
+                        ok_count += 1
+                    except Exception as exc:
+                        failed.append((entry_id, str(exc)))
+                st.session_state["auth_bulk_multiselect"] = []
+                if ok_count:
+                    st.success(f"Authorized {ok_count} draft(s).")
+                if failed:
+                    st.error(
+                        "Some authorizations failed: "
+                        + ", ".join([f"#{eid} ({msg})" for eid, msg in failed])
+                    )
+                st.rerun()
 
             for tx in to_approve:
                 with st.expander(f"Authorize Transfer: {format_dkk(tx['amount'])}"):
-                    st.checkbox(
-                        "Select for bulk authorize",
-                        key=f"auth_sel_{tx['entry_id']}",
-                    )
                     st.write(
                         f"**From Account:** {format_dk_account(tx['from_account_id']) if tx['from_account_id'] else '—'}"
                     )
@@ -1780,46 +1898,38 @@ if _portal == "Bank staff (operations)" and not st.session_state.logged_in_clien
                         )
                         st.error("Transaction denied.")
                         st.rerun()
-
-            selected_ids = [
-                tx["entry_id"]
-                for tx in to_approve
-                if st.session_state.get(f"auth_sel_{tx['entry_id']}", False)
-            ]
-            c_bulk1, c_bulk2 = st.columns([2, 3])
-            with c_bulk1:
-                bulk_btn = st.button(
-                    f"Authorize selected ({len(selected_ids)})",
-                    key="auth_bulk_btn",
-                    disabled=len(selected_ids) == 0,
-                )
-            with c_bulk2:
-                st.caption("Bulk action posts each selected draft via authorize_transaction.")
-
-            if bulk_btn:
-                ok_count = 0
-                failed = []
-                for entry_id in selected_ids:
-                    try:
-                        execute_sql("", callproc=("authorize_transaction", [entry_id]))
-                        ok_count += 1
-                    except Exception as exc:
-                        failed.append((entry_id, str(exc)))
-                for entry_id in selected_ids:
-                    st.session_state.pop(f"auth_sel_{entry_id}", None)
-                if ok_count:
-                    st.success(f"Authorized {ok_count} draft(s).")
-                if failed:
-                    st.error(
-                        "Some authorizations failed: "
-                        + ", ".join([f"#{eid} ({msg})" for eid, msg in failed])
-                    )
-                st.rerun()
         else:
             st.success("No transactions are currently awaiting approval.")
 
     with tab_interest:
         st.header("Monthly Interest Processing")
+        st.subheader("Reset last interest run (demo / grading)")
+        st.info(
+            "Reverses only the **latest** interest run for the whole bank: removes the `renta` "
+            "transactions on that period end date, restores balances, and deletes the `renturokning` "
+            "row so you can run interest again."
+        )
+        st.checkbox(
+            "I understand this will reverse the latest interest run for all accounts.",
+            key="confirm_undo_last_rentu",
+        )
+        if st.button(
+            "Undo last interest run",
+            help="Calls stored procedure undo_last_renturokning_run",
+        ):
+            if not st.session_state.get("confirm_undo_last_rentu"):
+                st.warning("Please tick the confirmation box above first.")
+            else:
+                try:
+                    execute_sql("", callproc=("undo_last_renturokning_run", []))
+                    st.success("Last interest run was undone. You can run interest processing again.")
+                    st.session_state["confirm_undo_last_rentu"] = False
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Undo failed: {user_facing_db_error(e)}")
+
+        st.divider()
+        st.subheader("Rates & run")
         st.write("Calculate interest for all accounts based on daily balances (bank operations).")
         try:
             _cfg = fetch_account_type_config()
