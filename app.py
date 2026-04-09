@@ -1369,6 +1369,42 @@ def get_user_client(email, raw_password):
     return rows[0]["client_id"] if rows else None
 
 
+def reset_online_password(email, p_tal_digits):
+    """
+    Demo reset: verify email + P-tal, then issue a new temporary password (no email delivery).
+    Returns (new_password, None) on success, or (None, error_message) on failure.
+    """
+    em = (email or "").strip()
+    pt = normalize_account_digits(p_tal_digits)
+    if not em:
+        return None, "Email is required."
+    if not is_valid_email(em):
+        return None, "Enter a valid email address."
+    if len(pt) != 9:
+        return None, "P-tal must be exactly 9 digits."
+    rows = fetchall_dict(
+        """
+        SELECT u.client_id, c.p_tal
+        FROM app_user u
+        INNER JOIN client c ON c.client_id = u.client_id
+        WHERE LOWER(TRIM(u.email)) = LOWER(TRIM(%s))
+        LIMIT 1
+        """,
+        (em,),
+    )
+    if not rows:
+        return None, "No online banking login found for that email."
+    stored_ptal = normalize_account_digits(rows[0].get("p_tal") or "")
+    if stored_ptal != pt:
+        return None, "P-tal does not match our records for this email."
+    new_pw = generate_temp_password()
+    execute_sql(
+        "UPDATE app_user SET password_hash = %s WHERE client_id = %s",
+        (hash_password(new_pw), rows[0]["client_id"]),
+    )
+    return new_pw, None
+
+
 def is_linked_child(client_id):
     rows = fetchall_dict(
         """
@@ -1801,7 +1837,7 @@ else:
         "Choose access",
         ["Customer", "Bank staff (operations)"],
         key="portal_choice",
-        help="Customers use Register / Log in. Bank staff use the operations console (no customer password here).",
+        help="Customers use Register, Log in, or Forgot password. Bank staff use the operations console (no customer password here).",
     )
 
 
@@ -2056,7 +2092,10 @@ if st.session_state.logged_in_client_id:
         key="dashboard_section",
     )
 else:
-    auth_action = st.sidebar.radio("Account Access", ["Register", "Log in"])
+    auth_action = st.sidebar.radio(
+        "Account Access",
+        ["Register", "Log in", "Forgot password"],
+    )
 
 min_dob = date(1900, 1, 1)
 max_dob = date.today()
@@ -2394,6 +2433,24 @@ if auth_action == "Log in":
                 st.rerun()
             else:
                 st.error("Invalid credentials.")
+
+if auth_action == "Forgot password":
+    st.header("Reset password")
+    st.caption(
+        "Enter the **email** and **P-tal** registered with your online banking. "
+        "If they match, you will receive a **new temporary password** here (demo: no email is sent)."
+    )
+    with st.form("forgot_password"):
+        fp_email = st.text_input("Email", key="fp_email")
+        fp_ptal = st.text_input("P-tal (9 digits)", key="fp_ptal", max_chars=12)
+        fp_submit = st.form_submit_button("Reset password")
+    if fp_submit:
+        new_pw, err = reset_online_password(fp_email, fp_ptal)
+        if err:
+            st.error(err)
+        else:
+            st.success("Your password has been reset. Log in with this temporary password (copy it now).")
+            st.code(new_pw, language=None)
 
 if st.session_state.logged_in_client_id:
     st.divider()
